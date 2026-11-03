@@ -2777,22 +2777,30 @@ def set_joint_attributes(
 
         if source_prim.HasAttribute("drive:angular:physics:targetPosition"):
             target_pos = source_prim.GetAttribute("drive:angular:physics:targetPosition").Get()
-            # Convert from degrees to radians for USD
-            target_pos_rad = math.radians(target_pos)
+            # [LiLo-Labs fork] UNIT FIX. The panel property drive_angular_target_position is a
+            # FloatProperty(unit="ROTATION"), so Blender stores it in RADIANS (the UI only displays degrees),
+            # and apply_joint_settings copies that raw radian value onto the reference empty. UsdPhysics
+            # DriveAPI angular targetPosition is in DEGREES. Upstream applied math.radians() here, i.e. a
+            # second rad conversion: -90 deg came out as -0.0274 (a factor of (180/pi)^2 ~= 3283 too small).
+            target_pos_deg = math.degrees(target_pos)
             joint_usd_prim.CreateAttribute("drive:angular:physics:targetPosition", Sdf.ValueTypeNames.Float).Set(
-                target_pos_rad
+                target_pos_deg
             )
-            print(f"  ✅ Set angular drive targetPosition: {target_pos}° ({target_pos_rad} rad)")
+            print(f"  ✅ Set angular drive targetPosition: {target_pos} rad ({target_pos_deg}°)")
 
         if source_prim.HasAttribute("drive:angular:physics:targetVelocity"):
             target_vel = source_prim.GetAttribute("drive:angular:physics:targetVelocity").Get()
-            # Convert from degrees/sec to radians/sec for USD
-            target_vel_rad = math.radians(target_vel)
+            # [LiLo-Labs fork] UNIT FIX, same as targetPosition above: the stored value is rad/s
+            # (unit="ROTATION" property), UsdPhysics angular targetVelocity is deg/s.
+            target_vel_deg = math.degrees(target_vel)
             joint_usd_prim.CreateAttribute("drive:angular:physics:targetVelocity", Sdf.ValueTypeNames.Float).Set(
-                target_vel_rad
+                target_vel_deg
             )
-            print(f"  ✅ Set angular drive targetVelocity: {target_vel}°/s ({target_vel_rad} rad/s)")
+            print(f"  ✅ Set angular drive targetVelocity: {target_vel} rad/s ({target_vel_deg}°/s)")
 
+        # [LiLo-Labs fork] damping/stiffness are passed through unchanged, so the panel values ARE the USD
+        # values: angular damping in force*s/deg (torque per deg/s) and stiffness in torque per degree.
+        # For an SI gain k (N*m*s/rad) enter k * pi/180. Newton multiplies by 180/pi on import.
         if source_prim.HasAttribute("drive:angular:physics:damping"):
             damping = source_prim.GetAttribute("drive:angular:physics:damping").Get()
             joint_usd_prim.CreateAttribute("drive:angular:physics:damping", Sdf.ValueTypeNames.Float).Set(damping)
@@ -2802,6 +2810,243 @@ def set_joint_attributes(
             stiffness = source_prim.GetAttribute("drive:angular:physics:stiffness").Get()
             joint_usd_prim.CreateAttribute("drive:angular:physics:stiffness", Sdf.ValueTypeNames.Float).Set(stiffness)
             print(f"  ✅ Set angular drive stiffness: {stiffness}")
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# [LiLo-Labs fork] fixes for Blender 5.2 / stock OpenUSD / Newton. Everything below is new code; the upstream joint
+# loop is unchanged apart from the gear/rack defines and one call to _lilo_post_joint_pass().
+# ----------------------------------------------------------------------------------------------------------------
+
+# Tokens of the PhysX coupling joints (PhysxSchema 110.x). Authored as plain typed prims, so they need no schema
+# plugin in Blender, and PhysX/Isaac (which has PhysxSchema) reads them as real gear / rack-and-pinion joints.
+_COUPLING_TYPES = ("PhysxPhysicsGearJoint", "PhysxPhysicsRackAndPinionJoint", "PhysicsGearJoint", "PhysicsRackPinionJoint")
+
+
+def _define_coupling_joint(stage, path, usd_physics_name, physx_type_name):
+    """Define a gear / rack-and-pinion joint prim without crashing on stock OpenUSD.
+
+    If a future OpenUSD ships UsdPhysics.GearJoint / RackPinionJoint, use it. Otherwise author the PhysX typed
+    prim by type name. Returns a UsdPhysics.Joint wrapper, so set_joint_attributes() can still write
+    body0/body1/breakForce on it (the Create*Attr calls only need the prim, not a registered type)."""
+    schema = getattr(UsdPhysics, usd_physics_name, None)
+    if schema is not None:
+        return schema.Define(stage, path)
+    prim = stage.DefinePrim(path, physx_type_name)
+    print(f"  ℹ️ UsdPhysics.{usd_physics_name} not in this OpenUSD; authored {physx_type_name} at {path}")
+    return UsdPhysics.Joint(prim)
+
+
+def _is_world_anchor(prim_name):
+    """A body is the WORLD when its Blender object is a passive rigid body or has simready:world_anchor = True.
+
+    SimReady's joint operator always needs two objects (body_0 and body_1), so the only way to pin a hinge to the
+    world was a dynamic dummy body, and Newton then failed to build the model (no joint reached the world). Marking
+    body_0 as an anchor makes the hook write the joint with an empty body0 relationship, which UsdPhysics defines as
+    the world frame."""
+    obj = bpy.data.objects.get(prim_name)
+    if obj is None:
+        return False
+    rb = getattr(obj, "rigid_body", None)
+    return bool(obj.get("simready:world_anchor", False)) or (rb is not None and rb.type == "PASSIVE")
+
+
+def _anchor_prim_for(stage, target_path):
+    """The Geometry-level prim (the exported Blender object) that owns target_path, if it is a world anchor."""
+    prim = stage.GetPrimAtPath(target_path)
+    while prim and prim.IsValid() and prim.GetPath() != Sdf.Path.absoluteRootPath:
+        if _is_world_anchor(prim.GetName()):
+            return prim
+        prim = prim.GetParent()
+    return None
+
+
+def _side_attrs(joint, side):
+    if side == 0:
+        return joint.GetBody0Rel(), joint.GetLocalPos0Attr(), joint.GetLocalRot0Attr()
+    return joint.GetBody1Rel(), joint.GetLocalPos1Attr(), joint.GetLocalRot1Attr()
+
+
+def _rebase_frame(stage, joint, side, new_target):
+    """Re-express one joint frame (localPos/localRot) from its current body prim into new_target's frame
+    (new_target=None: the world) and retarget the relationship. Full-matrix math, so scale/rotation are handled."""
+    rel, pos_attr, rot_attr = _side_attrs(joint, side)
+    old = rel.GetTargets()[0]
+    t = Usd.TimeCode.Default()
+    m_old = UsdGeom.Xformable(stage.GetPrimAtPath(old)).ComputeLocalToWorldTransform(t)
+    m_new = (UsdGeom.Xformable(stage.GetPrimAtPath(new_target)).ComputeLocalToWorldTransform(t)
+             if new_target is not None else Gf.Matrix4d(1.0))
+    pos = Gf.Vec3d(pos_attr.Get() or Gf.Vec3f(0, 0, 0))
+    rot = Gf.Quatd(rot_attr.Get() or Gf.Quatf(1, 0, 0, 0))
+    frame = Gf.Matrix4d(Gf.Rotation(rot), pos) * m_old * m_new.GetInverse()  # USD row-vector convention
+    pos_attr.Set(Gf.Vec3f(frame.ExtractTranslation()))
+    rot_attr.Set(Gf.Quatf(frame.GetOrthonormalized().ExtractRotationQuat().GetNormalized()))
+    if new_target is None:
+        rel.ClearTargets(True)
+    else:
+        rel.SetTargets([new_target])
+    return frame.ExtractTranslation()
+
+
+def _to_world(stage, joint, side):
+    """Joint side attached to a world anchor: express its frame in world space and clear that body relationship."""
+    rel = _side_attrs(joint, side)[0]
+    old = rel.GetTargets()[0]
+    world_pos = _rebase_frame(stage, joint, side, None)
+    print(f"  ✅ {joint.GetPath()}: body{side} {old} is a world anchor -> joint to world at {world_pos}")
+
+
+def _is_breakable(joint):
+    for attr in (joint.GetBreakForceAttr(), joint.GetBreakTorqueAttr()):
+        v = attr.Get() if attr and attr.HasAuthoredValue() else None
+        if v is not None and math.isfinite(float(v)):
+            return True
+    return False
+
+
+def _rigid_body_of(stage, path):
+    prim = stage.GetPrimAtPath(path)
+    while prim and prim.IsValid() and prim.GetPath() != Sdf.Path.absoluteRootPath:
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            return prim.GetPath()
+        prim = prim.GetParent()
+    return None
+
+
+def _author_couplings(stage, joint_scope_path):
+    """Finish gear / rack-and-pinion prims, and add the Newton form of a gear.
+
+    The operator stores the coupled hinges as reference-empty NAMES (pxr:usd:physics:joint:hinge0/hinge1); their
+    exported joints are <joint_scope>/joint_<name>. Gear convention, as in PhysX PxGearJoint with parallel,
+    same-direction hinge axes: q1 = -gearRatio * q0 (two meshing external gears counter-rotate; gearRatio = n0/n1).
+    Newton has no gear joint but imports NewtonMimicAPI (newton-usd-schemas): follower = coef0 + coef1 * leader,
+    so the follower hinge1 gets newton:mimicJoint -> hinge0, coef0 = 0, coef1 = -gearRatio."""
+    ref_scope = stage.GetPrimAtPath("/RootNode/ReferencePrims")
+    refs = {p.GetName(): p for p in (Usd.PrimRange(ref_scope) if ref_scope and ref_scope.IsValid() else [])}
+    for prim in list(stage.GetPrimAtPath(joint_scope_path).GetChildren()):
+        if prim.GetTypeName() not in _COUPLING_TYPES:
+            continue
+        src = refs.get(prim.GetName()[len("joint_"):])
+        if src is None:
+            print(f"  ⚠️ {prim.GetPath()}: no reference prim found; coupling left without hinges")
+            continue
+        for rel in (prim.GetRelationship("physics:body0"), prim.GetRelationship("physics:body1")):
+            t = rel.GetTargets() if rel else []
+            rb = _rigid_body_of(stage, t[0]) if t else None
+            if rb is not None and rb != t[0]:
+                rel.SetTargets([rb])
+        get = lambda k: src.GetAttribute(k).Get() if src.HasAttribute(k) else None  # noqa: E731
+        hinge = lambda name: joint_scope_path.AppendChild(f"joint_{name}") if name else None  # noqa: E731
+        if "Gear" in prim.GetTypeName():
+            h0, h1 = hinge(get("pxr:usd:physics:joint:hinge0")), hinge(get("pxr:usd:physics:joint:hinge1"))
+            ratio = float(get("pxr:usd:physics:joint:gearRatio") or 1.0)
+            prim.CreateAttribute("physics:gearRatio", Sdf.ValueTypeNames.Float).Set(ratio)
+            for k, h in (("physics:hinge0", h0), ("physics:hinge1", h1)):
+                if h is not None:
+                    prim.CreateRelationship(k).SetTargets([h])
+            leader, follower = stage.GetPrimAtPath(h0) if h0 else None, stage.GetPrimAtPath(h1) if h1 else None
+            if not (leader and leader.IsValid() and follower and follower.IsValid()):
+                print(f"  ⚠️ {prim.GetPath()}: gear needs two exported hinge joints (got {h0}, {h1}); no mimic written")
+                continue
+            follower.AddAppliedSchema("NewtonMimicAPI")
+            follower.CreateRelationship("newton:mimicJoint").SetTargets([leader.GetPath()])
+            follower.CreateAttribute("newton:mimicCoef0", Sdf.ValueTypeNames.Float).Set(0.0)
+            follower.CreateAttribute("newton:mimicCoef1", Sdf.ValueTypeNames.Float).Set(-ratio)
+            print(f"  ✅ gear {prim.GetPath()}: {follower.GetPath()} = -{ratio} * {leader.GetPath()} (NewtonMimicAPI)")
+        else:
+            for k, src_key in (("physics:hinge", "pxr:usd:physics:hinge"), ("physics:prismatic", "pxr:usd:physics:prismatic")):
+                h = hinge(get(src_key))
+                if h is not None:
+                    prim.CreateRelationship(k).SetTargets([h])
+            ratio = get("pxr:usd:physics:joint:ratio")
+            if ratio is not None:
+                prim.CreateAttribute("physics:ratio", Sdf.ValueTypeNames.Float).Set(float(ratio))
+            # NewtonMimicAPI cannot couple an angular and a linear joint (no defined units), so PhysX-only.
+            print(f"  ⚠️ rack&pinion {prim.GetPath()}: written for PhysX only (Newton has no angular<->linear coupling)")
+
+
+def _author_articulation_roots(stage, joint_scope_path):
+    """Make every joint graph importable by Newton without changing what PhysX simulates.
+
+    Newton (1.7 / main) only accepts a joint whose parent is not the world if it belongs to an articulation, and
+    SimReady authors no PhysicsArticulationRootAPI at all, so a floating assembly such as bucket + bail failed
+    ModelBuilder.finalize() with "joint(s) not belonging to any articulation".
+      * breakable joints (finite breakForce/breakTorque) get physics:excludeFromArticulation = True: PhysX ignores
+        breakForce on articulation joints, and Newton's Steel break test needs them as loop-closing joints;
+      * every joint-connected group of rigid bodies with no joint to the world gets ArticulationRootAPI on its
+        root body (a body that is never body1), i.e. a floating-base articulation.
+    Groups that already reach the world are left as they are (Newton accepts world-parented joints)."""
+    joints = []
+    for prim in Usd.PrimRange(stage.GetPrimAtPath(joint_scope_path)):
+        if not prim.IsA(UsdPhysics.Joint) or prim.GetTypeName() in _COUPLING_TYPES:
+            continue
+        j = UsdPhysics.Joint(prim)
+        b = [j.GetBody0Rel().GetTargets(), j.GetBody1Rel().GetTargets()]
+        b = [_rigid_body_of(stage, t[0]) if t else None for t in b]
+        if _is_breakable(j):
+            j.CreateExcludeFromArticulationAttr().Set(True)
+            print(f"  ✅ {prim.GetPath()}: breakable -> excludeFromArticulation")
+        joints.append(b)
+    parent = {}
+
+    def find(x):
+        while parent.setdefault(x, x) != x:
+            x = parent[x]
+        return x
+
+    for b0, b1 in joints:
+        if b0 is not None and b1 is not None:
+            parent[find(b0)] = find(b1)
+    world = {find(b) for b0, b1 in joints for b in (b0, b1) if b is not None and None in (b0, b1)}
+    children = {b1 for b0, b1 in joints if b0 is not None and b1 is not None}
+    done = set()
+    for b0, b1 in joints:
+        if b0 is None or b1 is None or find(b0) in world or find(b0) in done:
+            continue
+        group = [b for pair in joints for b in pair if b is not None and find(b) == find(b0)]
+        root = next((b for b in group if b not in children), group[0])
+        UsdPhysics.ArticulationRootAPI.Apply(stage.GetPrimAtPath(root))
+        done.add(find(b0))
+        print(f"  ✅ floating joint group rooted at {root} (PhysicsArticulationRootAPI)")
+
+
+def _lilo_post_joint_pass(stage, joint_scope_path):
+    """Run after all joints exist: world anchors, couplings, articulation roots. Never raises into the export."""
+    try:
+        anchors = set()
+        for prim in Usd.PrimRange(stage.GetPrimAtPath(joint_scope_path)):
+            if not prim.IsA(UsdPhysics.Joint) or prim.GetTypeName() in _COUPLING_TYPES:
+                continue
+            j = UsdPhysics.Joint(prim)
+            for side, rel in ((0, j.GetBody0Rel()), (1, j.GetBody1Rel())):
+                t = rel.GetTargets()
+                anchor = _anchor_prim_for(stage, t[0]) if t else None
+                if anchor is not None:
+                    _to_world(stage, j, side)
+                    anchors.add(anchor.GetPath())
+                    continue
+                # Upstream targets the body's collider MESH (<obj>/<mesh>), not the prim carrying RigidBodyAPI.
+                # PhysX walks up to the body, but the OpenUSD usdPhysicsValidators reject it
+                # (JointNoEnabledRigidBody) and Newton's articulation parser cannot resolve it. Retarget to the
+                # rigid body and move the joint frame with it.
+                rb = _rigid_body_of(stage, t[0]) if t else None
+                if rb is not None and rb != t[0]:
+                    _rebase_frame(stage, j, side, rb)
+                    print(f"  ✅ {prim.GetPath()}: body{side} {t[0]} -> rigid body {rb}")
+        geo = stage.GetPrimAtPath("/RootNode/Geometry")
+        for prim in Usd.PrimRange(geo) if geo and geo.IsValid() else []:
+            if _is_world_anchor(prim.GetName()):
+                anchors.add(prim.GetPath())
+        for path in anchors:  # static collider: keep CollisionAPI/material, drop the rigid body the loop applied
+            p = stage.GetPrimAtPath(path)
+            if p.HasAPI(UsdPhysics.RigidBodyAPI):
+                p.RemoveAPI(UsdPhysics.RigidBodyAPI)
+                print(f"  ✅ {path}: world anchor -> static (RigidBodyAPI removed)")
+        _author_couplings(stage, joint_scope_path)
+        _author_articulation_roots(stage, joint_scope_path)
+    except Exception as e:  # keep the export alive; report loudly
+        import traceback
+
+        print(f"  ❌ [LiLo-Labs fork] post-joint pass failed: {e}\n{traceback.format_exc()}")
 
 
 def detect_root_hierarchy(stage: Usd.Stage, dp) -> tuple[bool, str]:
@@ -3275,8 +3520,11 @@ class SimReadyUSDHook(bpy.types.USDHook):
                                 stage, joint_scope_path.AppendChild(joint_prim_name)
                             )
                         elif joint_type == "gear":
-                            joint_prim = UsdPhysics.GearJoint.Define(
-                                stage, joint_scope_path.AppendChild(joint_prim_name)
+                            # [LiLo-Labs fork] stock OpenUSD (incl. Blender 5.2's 26.x) has no UsdPhysics.GearJoint,
+                            # so upstream raised AttributeError here and the whole export failed. See
+                            # _define_coupling_joint / _lilo_post_joint_pass for what is written instead.
+                            joint_prim = _define_coupling_joint(
+                                stage, joint_scope_path.AppendChild(joint_prim_name), "GearJoint", "PhysxPhysicsGearJoint"
                             )
                         elif joint_type == "spherical":
                             joint_prim = UsdPhysics.SphericalJoint.Define(
@@ -3285,8 +3533,12 @@ class SimReadyUSDHook(bpy.types.USDHook):
                         elif joint_type == "d6":
                             joint_prim = UsdPhysics.D6Joint.Define(stage, joint_scope_path.AppendChild(joint_prim_name))
                         elif joint_type == "rack_and_pinion":
-                            joint_prim = UsdPhysics.RackPinionJoint.Define(
-                                stage, joint_scope_path.AppendChild(joint_prim_name)
+                            # [LiLo-Labs fork] same as gear: no UsdPhysics.RackPinionJoint in stock OpenUSD.
+                            joint_prim = _define_coupling_joint(
+                                stage,
+                                joint_scope_path.AppendChild(joint_prim_name),
+                                "RackPinionJoint",
+                                "PhysxPhysicsRackAndPinionJoint",
                             )
                         elif joint_type == "fixed":
                             joint_prim = UsdPhysics.FixedJoint.Define(
@@ -3453,6 +3705,9 @@ class SimReadyUSDHook(bpy.types.USDHook):
                     except Exception as e:
                         print(f"⚠️ No linked object found for {prim_name} - {e}")
                         pass
+
+            # [LiLo-Labs fork] world anchors, gear/rack coupling and articulation roots (see _lilo_post_joint_pass)
+            _lilo_post_joint_pass(stage, joint_scope_path)
 
             grasp_identifier_scope_path = Sdf.Path("/RootNode/Grasp")
             grasp_prim = stage.GetPrimAtPath(grasp_identifier_scope_path)

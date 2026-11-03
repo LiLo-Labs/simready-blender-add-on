@@ -2107,6 +2107,37 @@ class SRCORE_OT_apply_joint_settings(Operator):
     3. Applies pxr attributes to the reference prims
     """
 
+    def _apply_coupling_joint(self, context, props, joint_type, allowed_fields, refprim_col):
+        """[LiLo-Labs fork] Write a gear / rack-and-pinion joint onto a NEW reference empty (see execute())."""
+        hinges = ("gear_hinge_0", "gear_hinge_1") if joint_type == "gear" else ("rp_hinge", "rp_prismatic")
+        missing = [h for h in hinges if getattr(props, h) is None]
+        if missing:
+            self.report({"ERROR"}, f"{joint_type} joint needs {', '.join(missing)} (the coupled joints' reference empties)")
+            return {"CANCELLED"}
+        child = props.body_1
+        base = re.sub(r"_obj_\d{2}$", "", child.name) + ("Gear" if joint_type == "gear" else "RackPinion")
+        bpy.ops.object.select_all(action="DESELECT")
+        bpy.ops.object.empty_add(type="PLAIN_AXES", location=child.matrix_world.translation)
+        empty = context.active_object
+        empty.name = f"{base}_joint_00"
+        auto_rename_object(empty, "joint", base)
+        for col in list(empty.users_collection):
+            if col != refprim_col:
+                col.objects.unlink(empty)
+        if empty.name not in refprim_col.objects:
+            refprim_col.objects.link(empty)
+        for ui_key, usd_key in JOINT_EXPORT_MAP.items():
+            if ui_key not in allowed_fields or isinstance(usd_key, (list, tuple)):
+                continue
+            value = getattr(props, ui_key)
+            if isinstance(value, bpy.types.ID):  # body_0/body_1/hinges: store object names, as upstream does
+                value = value.name
+            elif hasattr(value, "__len__") and not isinstance(value, str):
+                value = tuple(value)
+            empty[usd_key] = value
+        self.report({"INFO"}, f"{joint_type} joint written to {empty.name}")
+        return {"FINISHED"}
+
     def clear_simready_joint_properties(self, obj):
         keys_to_remove = [
             k
@@ -2321,6 +2352,13 @@ class SRCORE_OT_apply_joint_settings(Operator):
 
         geometry_col = simready_subcols["Geometry"]
         refprim_col = simready_subcols["ReferencePrims"]
+
+        # [LiLo-Labs fork] gear / rack-and-pinion joints COUPLE two existing joints; they do not hold body_1.
+        # Upstream ran them through the normal path below, which reuses body_1's reference empty, clears its
+        # pxr:usd:* props and rewrites them as the gear: body_1's own revolute (the gear's hinge1) was destroyed,
+        # and the gear_hinge_1 pointer to that empty came back as None. Give the coupling its own empty instead.
+        if joint_type in ("gear", "rack_and_pinion"):
+            return self._apply_coupling_joint(context, props, joint_type, allowed_fields, refprim_col)
 
         for obj in (parent, child):
             # Unlink from all collections
