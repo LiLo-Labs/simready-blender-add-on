@@ -822,11 +822,13 @@ class JointAttributeProperties(bpy.types.PropertyGroup):
     )
 
     drive_angular_damping: bpy.props.FloatProperty(
-        name="Damping", description="Damping coefficient for the drive", default=0.0, min=0.0, soft_max=1000.0
+        name="Damping",
+        description="Damping coefficient for the drive, written to USD unchanged (USD units: torque per deg/s)", default=0.0, min=0.0, soft_max=1000.0
     )
 
     drive_angular_stiffness: bpy.props.FloatProperty(
-        name="Stiffness", description="Stiffness coefficient for the drive", default=0.0, min=0.0, soft_max=10000.0
+        name="Stiffness",
+        description="Stiffness coefficient for the drive, written to USD unchanged (USD units: torque per degree)", default=0.0, min=0.0, soft_max=10000.0
     )
 
     show_widgets: bpy.props.BoolProperty(
